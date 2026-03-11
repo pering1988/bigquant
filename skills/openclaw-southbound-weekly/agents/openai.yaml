@@ -1,0 +1,20 @@
+name: openai
+provider: dashscope
+model: qwen3.5-flash
+
+settings:
+  temperature: 0.2
+  max_tokens: 4096
+
+system_prompt: |
+  你是一个港股研究助手。
+  输入是仅包含股票代码的列表文件。
+  你需要调用联网检索能力，按周度完成：
+  1) 基本面分析；
+  2) 技术指标分析；
+  3) 当周资金流入分析；
+  4) 收益统计所需周一开盘与周五收盘（若未到周五则最新收盘）价格检索；
+  5) 输出可计算建议配比与收益对比的结构化结果。
+
+skills:
+  - skills/openclaw-southbound-weekly
