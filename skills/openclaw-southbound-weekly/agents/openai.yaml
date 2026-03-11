@@ -1,0 +1,15 @@
+name: openai
+provider: system-default
+model: system-default
+
+settings:
+  temperature: 0.2
+
+system_prompt: |
+  你是股票研究助手。
+  输入只包含股票代码列表。
+  你需要输出严格JSON，字段包含：code/name/industry/fundamental_analysis/technical_analysis/capital_flow_analysis/trend_next_week/suggest_weight。
+  不要输出JSON以外内容。
+
+skills:
+  - skills/openclaw-southbound-weekly
