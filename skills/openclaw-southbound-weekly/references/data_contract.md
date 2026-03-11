@@ -1,42 +1,46 @@
-# 数据契约（列名兼容）
+# 数据契约（简化版）
 
-输入文件默认为：**最近一周南向资金流入最多Top2行业的前10只股票**。脚本采用候选列名自动匹配。
+## 输入文件
 
-## 必需维度
+- 目录：`/home/admin/.openclaw/workspace/stockdata/south_stocklist`
+- 文件名：需包含 `YYYYMMDD` 后缀日期
+- 内容：仅股票代码列表（txt/csv）
 
-- 股票代码：`code` / `stock_code` / `symbol`
-- 股票名称：`name` / `stock_name`
-- 行业：`industry` / `industry_name` / `sector`
+### txt 示例
 
-## 建议提供（用于行业聚合展示）
+```text
+00700.HK
+00941.HK
+03690.HK
+```
 
-- 南向净流入：`south_net_inflow` / `southbound_net_inflow` / `net_inflow`
+### csv 示例
 
-## 基本面候选列
+```csv
+code
+00700.HK
+00941.HK
+03690.HK
+```
 
-- `pe`, `pb`, `roe`, `revenue_yoy`, `profit_yoy`
+## 大模型返回结构
 
-## 技术面候选列
+脚本要求模型返回 JSON，核心字段：
 
-- `rsi`, `ma5`, `ma20`, `close`, `macd`
+- `stocks[]`
+  - `code`
+  - `name`
+  - `industry`
+  - `fundamental_analysis`
+  - `technical_analysis`
+  - `capital_flow_analysis`
+  - `trend_next_week`
+  - `suggest_weight`
+  - `monday_open`
+  - `sell_price`
 
-## 资金面增强候选列
+## 输出文件
 
-- `main_net_inflow`, `volume_ratio`, `turnover_rate`
-
-## 收益测算价格列（优先级从左到右）
-
-- 周一开盘：`monday_open` / `open_monday` / `week_open` / `open`
-- 周五收盘：`friday_close` / `close_friday` / `week_close`
-- 最新收盘：`latest_close` / `current_close` / `close`
-
-若执行时未到周五或无周五收盘列，脚本使用“最新收盘”作为卖出价。
-
-## 飞书上传参数
-
-- `FEISHU_APP_ID`
-- `FEISHU_APP_SECRET`
-- `FEISHU_FOLDER_TOKEN`
-
-或通过命令行参数显式传入：
-`--feishu-app-id` / `--feishu-app-secret` / `--feishu-folder-token`
+- `top10_selection.csv`
+- `allocation_and_pnl.csv`
+- `summary.md`

@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
+"""简化版周度分析脚本。
+
+核心约束（按用户诉求）：
+1) 输入文件仅包含股票代码列表；
+2) 基本面/技术面/当周资金流入分析由已配置大模型完成；
+3) 收益统计所需的开盘/收盘（或最新收盘）价格也由大模型检索；
+4) 输出建议配比策略与等额策略收益对比，并可上传飞书。
+"""
+
 import argparse
+import csv
 import datetime as dt
 import json
 import os
@@ -9,24 +19,15 @@ import urllib.request
 import uuid
 from pathlib import Path
 
-import pandas as pd
-
 DATE_RE = re.compile(r"(20\d{6})")
 
 
-def pick_col(df: pd.DataFrame, candidates):
-    """从候选列名列表中返回第一个命中的列名。"""
-    for c in candidates:
-        if c in df.columns:
-            return c
-    return None
-
-
 def latest_file(input_dir: Path) -> tuple[Path, dt.date]:
-    """扫描目录并返回“文件名包含YYYYMMDD日期”的最新文件及其日期。"""
-    files = [p for p in input_dir.iterdir() if p.is_file()]
+    """返回目录中日期后缀(YYYYMMDD)最新的文件和该日期。"""
     dated = []
-    for f in files:
+    for f in input_dir.iterdir():
+        if not f.is_file():
+            continue
         m = DATE_RE.search(f.stem) or DATE_RE.search(f.name)
         if not m:
             continue
@@ -34,182 +35,231 @@ def latest_file(input_dir: Path) -> tuple[Path, dt.date]:
         dated.append((d, f))
     if not dated:
         raise FileNotFoundError("未找到包含 YYYYMMDD 日期后缀的文件")
-    d, f = sorted(dated, key=lambda x: x[0])[-1]
-    return f, d
+    return sorted(dated, key=lambda x: x[0])[-1][1], sorted(dated, key=lambda x: x[0])[-1][0]
 
 
-def read_any(path: Path) -> pd.DataFrame:
-    """按后缀读取常见表格文件。"""
-    suf = path.suffix.lower()
-    if suf in {".csv", ".txt"}:
-        return pd.read_csv(path)
-    if suf in {".xlsx", ".xls"}:
-        return pd.read_excel(path)
-    if suf == ".parquet":
-        return pd.read_parquet(path)
-    raise ValueError(f"不支持的文件类型: {suf}")
+def read_stock_codes(path: Path) -> list[str]:
+    """读取股票代码列表（支持txt/csv）。"""
+    suffix = path.suffix.lower()
+    codes: list[str] = []
+
+    if suffix in {".txt", ".list"}:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            code = line.strip().split(",")[0]
+            if code and code.lower() not in {"code", "stock_code", "symbol"}:
+                codes.append(code)
+    elif suffix == ".csv":
+        with path.open("r", encoding="utf-8-sig", newline="") as f:
+            rows = list(csv.reader(f))
+        if not rows:
+            return []
+        header = [h.strip().lower() for h in rows[0]]
+        idx = 0
+        for cand in ["code", "stock_code", "symbol"]:
+            if cand in header:
+                idx = header.index(cand)
+                break
+        data_rows = rows[1:] if any(h in {"code", "stock_code", "symbol"} for h in header) else rows
+        for r in data_rows:
+            if idx < len(r):
+                code = r[idx].strip()
+                if code:
+                    codes.append(code)
+    else:
+        raise ValueError("仅支持 txt/csv 股票列表文件")
+
+    # 去重并保持顺序
+    dedup = []
+    seen = set()
+    for c in codes:
+        if c not in seen:
+            seen.add(c)
+            dedup.append(c)
+    if not dedup:
+        raise ValueError("股票列表为空")
+    return dedup
 
 
-def zscore(s):
-    """计算标准分，遇到样本不足或标准差为0时返回全0序列。"""
-    s = pd.to_numeric(s, errors="coerce")
-    if s.notna().sum() < 2:
-        return pd.Series([0.0] * len(s), index=s.index)
-    std = s.std(ddof=0)
-    if std == 0 or pd.isna(std):
-        return pd.Series([0.0] * len(s), index=s.index)
-    return (s - s.mean()) / std
+def parse_simple_yaml_agent(path: Path) -> dict:
+    """简化解析 agent yaml，只读取 provider/model。"""
+    text = path.read_text(encoding="utf-8")
+    provider = re.search(r"^provider:\s*(.+)$", text, flags=re.M)
+    model = re.search(r"^model:\s*(.+)$", text, flags=re.M)
+    if not provider or not model:
+        raise ValueError("agent yaml 缺少 provider 或 model")
+    return {
+        "provider": provider.group(1).strip(),
+        "model": model.group(1).strip(),
+    }
 
 
-def compute_scores(df: pd.DataFrame) -> pd.DataFrame:
-    """基于基本面/技术面/资金面计算综合分与建议权重。"""
-    # ---------- 基本面得分 ----------
-    pe = pick_col(df, ["pe"])
-    pb = pick_col(df, ["pb"])
-    roe = pick_col(df, ["roe"])
-    rev = pick_col(df, ["revenue_yoy"])
-    profit = pick_col(df, ["profit_yoy"])
+def call_model(agent_cfg: dict, prompt: str) -> str:
+    """调用 OpenAI 兼容聊天接口（支持 dashscope 兼容网关）。"""
+    # 优先使用环境变量覆盖 endpoint/key
+    base_url = os.getenv("LLM_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+    api_key = os.getenv("LLM_API_KEY") or os.getenv("DASHSCOPE_API_KEY")
+    if not api_key:
+        raise RuntimeError("缺少 LLM_API_KEY / DASHSCOPE_API_KEY")
 
-    f_score = pd.Series(0.0, index=df.index)
-    if pe:
-        f_score += -zscore(df[pe]) * 0.20
-    if pb:
-        f_score += -zscore(df[pb]) * 0.15
-    if roe:
-        f_score += zscore(df[roe]) * 0.30
-    if rev:
-        f_score += zscore(df[rev]) * 0.20
-    if profit:
-        f_score += zscore(df[profit]) * 0.15
-
-    # ---------- 技术面得分 ----------
-    rsi = pick_col(df, ["rsi"])
-    ma5 = pick_col(df, ["ma5"])
-    ma20 = pick_col(df, ["ma20"])
-    close = pick_col(df, ["close"])
-    macd = pick_col(df, ["macd"])
-
-    t_score = pd.Series(0.0, index=df.index)
-    if rsi:
-        r = pd.to_numeric(df[rsi], errors="coerce")
-        t_score += (-(r - 55).abs() / 100).fillna(0) * 0.25
-    if ma5 and ma20:
-        t_score += zscore(pd.to_numeric(df[ma5], errors="coerce") - pd.to_numeric(df[ma20], errors="coerce")) * 0.45
-    elif close and ma20:
-        t_score += zscore(pd.to_numeric(df[close], errors="coerce") - pd.to_numeric(df[ma20], errors="coerce")) * 0.45
-    if macd:
-        t_score += zscore(df[macd]) * 0.30
-
-    # ---------- 资金面得分 ----------
-    south = pick_col(df, ["south_net_inflow", "southbound_net_inflow", "net_inflow"])
-    main = pick_col(df, ["main_net_inflow"])
-    vol = pick_col(df, ["volume_ratio"])
-    turn = pick_col(df, ["turnover_rate"])
-
-    c_score = pd.Series(0.0, index=df.index)
-    if south:
-        c_score += zscore(df[south]) * 0.60
-    if main:
-        c_score += zscore(df[main]) * 0.25
-    if vol:
-        c_score += zscore(df[vol]) * 0.10
-    if turn:
-        c_score += zscore(df[turn]) * 0.05
-
-    # 综合分：基本面35% + 技术面25% + 资金面40%
-    out = df.copy()
-    out["fundamental_score"] = f_score
-    out["technical_score"] = t_score
-    out["capital_score"] = c_score
-    out["total_score"] = 0.35 * f_score + 0.25 * t_score + 0.40 * c_score
-
-    # 仅对正分部分归一化分配权重；若全部<=0，则改为等权
-    positive = out["total_score"].clip(lower=0)
-    out["suggest_weight"] = (positive / positive.sum()) if positive.sum() else (1 / len(out))
-    return out
+    body = {
+        "model": agent_cfg["model"],
+        "messages": [
+            {
+                "role": "system",
+                "content": "你是股票研究员。必须返回严格JSON，且不要输出JSON外文本。",
+            },
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.2,
+    }
+    req = urllib.request.Request(
+        url=f"{base_url.rstrip('/')}/chat/completions",
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+        data=json.dumps(body).encode("utf-8"),
+    )
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        out = json.loads(resp.read().decode("utf-8"))
+    return out["choices"][0]["message"]["content"]
 
 
-def calc_pnl(df: pd.DataFrame, capital: float):
-    """计算建议配比与等额配比两种策略的收益。"""
-    # 兼容多种价格字段命名
-    monday_col = pick_col(df, ["monday_open", "open_monday", "week_open", "open"])
-    friday_col = pick_col(df, ["friday_close", "close_friday", "week_close"])
-    latest_close_col = pick_col(df, ["latest_close", "current_close", "close"])
-    if not monday_col:
-        raise ValueError("缺少周一开盘价列（monday_open/open_monday/week_open/open）")
+def build_analysis_prompt(codes: list[str], start_date: dt.date) -> str:
+    """构造让大模型完成分析与行情检索的统一提示词。"""
+    today = dt.date.today()
+    sell_rule = "周五收盘" if today.weekday() >= 4 else "当前最新收盘"
+    template = {
+        "meta": {
+            "start_date": str(start_date),
+            "sell_rule": sell_rule,
+        },
+        "stocks": [
+            {
+                "code": "",
+                "name": "",
+                "industry": "",
+                "fundamental_analysis": "",
+                "technical_analysis": "",
+                "capital_flow_analysis": "",
+                "trend_next_week": "看涨/震荡/看跌",
+                "suggest_weight": 0.0,
+                "monday_open": 0.0,
+                "sell_price": 0.0,
+            }
+        ],
+        "notes": "可选说明",
+    }
+    return (
+        "请对以下股票代码完成周度分析，并自行检索需要的市场与资金数据。\n"
+        "股票列表：" + ",".join(codes) + "\n"
+        "周期起始日：" + str(start_date) + "\n"
+        "要求：\n"
+        "1) 对每只股票给出基本面、技术面、当周资金流入分析与未来一周走势判断；\n"
+        "2) 给出建议买入权重 suggest_weight（所有股票之和必须=1）；\n"
+        "3) 给出收益计算用价格：monday_open 与 sell_price（若未到周五取最新收盘，若到周五取周五收盘）；\n"
+        "4) 返回严格 JSON，结构必须匹配此模板，不允许额外文本：\n"
+        + json.dumps(template, ensure_ascii=False)
+    )
 
-    # 周五前（周一~周四）默认使用最新收盘作为卖出价
-    use_latest = dt.datetime.now().weekday() < 4
-    sell_col = latest_close_col if use_latest or not friday_col else friday_col
-    if not sell_col:
-        raise ValueError("缺少卖出价格列（friday_close/close_friday/week_close/latest_close/current_close/close）")
 
-    # 收益率 = 卖出价 / 买入价 - 1
-    d = df.copy()
-    d["buy_price"] = pd.to_numeric(d[monday_col], errors="coerce")
-    d["sell_price"] = pd.to_numeric(d[sell_col], errors="coerce")
-    d["ret"] = d["sell_price"] / d["buy_price"] - 1
+def normalize_and_calc(stocks: list[dict], capital: float):
+    """归一化权重并计算建议配比/等额配比收益。"""
+    if not stocks:
+        raise ValueError("模型返回 stocks 为空")
 
-    # 策略A：按模型建议权重分配资金
-    d["amount_suggest"] = capital * d["suggest_weight"]
-    d["pnl_suggest"] = d["amount_suggest"] * d["ret"]
+    # 归一化权重，避免模型小数误差
+    raw_weights = [max(float(s.get("suggest_weight", 0)), 0.0) for s in stocks]
+    w_sum = sum(raw_weights)
+    if w_sum == 0:
+        weights = [1 / len(stocks)] * len(stocks)
+    else:
+        weights = [w / w_sum for w in raw_weights]
 
-    # 策略B：总资金等额分配
-    d["amount_equal"] = capital / len(d)
-    d["pnl_equal"] = d["amount_equal"] * d["ret"]
-    return d, use_latest
+    rows = []
+    for i, s in enumerate(stocks):
+        code = str(s.get("code", "")).strip()
+        name = str(s.get("name", "")).strip()
+        industry = str(s.get("industry", "")).strip()
+        m_open = float(s.get("monday_open", 0) or 0)
+        s_price = float(s.get("sell_price", 0) or 0)
+        if m_open <= 0 or s_price <= 0:
+            ret = 0.0
+        else:
+            ret = s_price / m_open - 1
+
+        amount_suggest = capital * weights[i]
+        amount_equal = capital / len(stocks)
+        pnl_suggest = amount_suggest * ret
+        pnl_equal = amount_equal * ret
+        rows.append(
+            {
+                "code": code,
+                "name": name,
+                "industry": industry,
+                "fundamental_analysis": s.get("fundamental_analysis", ""),
+                "technical_analysis": s.get("technical_analysis", ""),
+                "capital_flow_analysis": s.get("capital_flow_analysis", ""),
+                "trend_next_week": s.get("trend_next_week", ""),
+                "suggest_weight": round(weights[i], 6),
+                "monday_open": m_open,
+                "sell_price": s_price,
+                "ret": ret,
+                "amount_suggest": amount_suggest,
+                "pnl_suggest": pnl_suggest,
+                "amount_equal": amount_equal,
+                "pnl_equal": pnl_equal,
+            }
+        )
+    return rows
+
+
+def write_csv(path: Path, rows: list[dict], fields: list[str]):
+    with path.open("w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: r.get(k, "") for k in fields})
 
 
 def _request_json(url: str, method: str = "GET", headers: dict | None = None, data: bytes | None = None):
-    """发送HTTP请求并将响应解析为JSON。"""
     req = urllib.request.Request(url=url, method=method, headers=headers or {}, data=data)
     with urllib.request.urlopen(req, timeout=30) as resp:
-        body = resp.read().decode("utf-8")
-    return json.loads(body)
-
-
-def get_feishu_token(app_id: str, app_secret: str) -> str:
-    """调用飞书开放平台接口获取 tenant_access_token。"""
-    payload = json.dumps({"app_id": app_id, "app_secret": app_secret}).encode("utf-8")
-    rsp = _request_json(
-        "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
-        method="POST",
-        headers={"Content-Type": "application/json; charset=utf-8"},
-        data=payload,
-    )
-    if rsp.get("code") != 0:
-        raise RuntimeError(f"获取飞书token失败: {rsp}")
-    return rsp["tenant_access_token"]
+        return json.loads(resp.read().decode("utf-8"))
 
 
 def upload_to_feishu_drive(file_path: Path, app_id: str, app_secret: str, folder_token: str) -> str:
-    """上传本地文件到飞书云盘目录，返回URL或文件token。"""
-    token = get_feishu_token(app_id, app_secret)
+    """上传 summary.md 到飞书云盘。"""
+    token_rsp = _request_json(
+        "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+        method="POST",
+        headers={"Content-Type": "application/json; charset=utf-8"},
+        data=json.dumps({"app_id": app_id, "app_secret": app_secret}).encode("utf-8"),
+    )
+    if token_rsp.get("code") != 0:
+        raise RuntimeError(f"获取飞书token失败: {token_rsp}")
+    token = token_rsp["tenant_access_token"]
+
     file_bytes = file_path.read_bytes()
     boundary = f"----codex-{uuid.uuid4().hex}"
-
-    fields = {
+    chunks = []
+    for k, v in {
         "file_name": file_path.name,
         "parent_type": "explorer",
         "parent_node": folder_token,
         "size": str(len(file_bytes)),
-    }
-
-    # 采用 multipart/form-data 手工拼接上传体
-    chunks = []
-    for k, v in fields.items():
+    }.items():
         chunks.append(f"--{boundary}\r\n".encode())
         chunks.append(f'Content-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode())
-
     chunks.append(f"--{boundary}\r\n".encode())
     chunks.append(
         f'Content-Disposition: form-data; name="file"; filename="{file_path.name}"\r\nContent-Type: text/markdown\r\n\r\n'.encode()
     )
     chunks.append(file_bytes)
-    chunks.append("\r\n".encode())
+    chunks.append(b"\r\n")
     chunks.append(f"--{boundary}--\r\n".encode())
 
-    body = b"".join(chunks)
     rsp = _request_json(
         "https://open.feishu.cn/open-apis/drive/v1/files/upload_all",
         method="POST",
@@ -217,145 +267,116 @@ def upload_to_feishu_drive(file_path: Path, app_id: str, app_secret: str, folder
             "Authorization": f"Bearer {token}",
             "Content-Type": f"multipart/form-data; boundary={boundary}",
         },
-        data=body,
+        data=b"".join(chunks),
     )
     if rsp.get("code") != 0:
-        raise RuntimeError(f"上传飞书云文档失败: {rsp}")
-    data = rsp.get("data", {})
-    return data.get("url") or data.get("file_token", "")
-
-
-def build_dataset(raw: pd.DataFrame) -> pd.DataFrame:
-    """校验输入结构并整理分析样本（最多保留10只）。"""
-    code_col = pick_col(raw, ["code", "stock_code", "symbol"])
-    name_col = pick_col(raw, ["name", "stock_name"])
-    ind_col = pick_col(raw, ["industry", "industry_name", "sector"])
-    inflow_col = pick_col(raw, ["south_net_inflow", "southbound_net_inflow", "net_inflow"])
-
-    for k, v in {"code": code_col, "name": name_col, "industry": ind_col}.items():
-        if not v:
-            raise ValueError(f"缺少必要字段: {k}")
-
-    d = raw.copy()
-    if inflow_col:
-        d[inflow_col] = pd.to_numeric(d[inflow_col], errors="coerce")
-
-    # 用户指定：文件本身就是“最近一周南向流入最多Top2行业的Top10股票”。
-    # 因此不再按全市场重算，仅在行数>10时按南向净流入降序截取前10。
-    if len(d) > 10 and inflow_col:
-        d = d.sort_values(inflow_col, ascending=False).head(10).copy()
-    elif len(d) > 10:
-        d = d.head(10).copy()
-
-    return d
+        raise RuntimeError(f"上传飞书失败: {rsp}")
+    return rsp.get("data", {}).get("url") or rsp.get("data", {}).get("file_token", "")
 
 
 def main():
-    """命令行入口：执行选股分析、收益对比与飞书上传。"""
     ap = argparse.ArgumentParser()
     ap.add_argument("--input-dir", default="/home/admin/.openclaw/workspace/stockdata/south_stocklist")
     ap.add_argument("--capital", type=float, default=150000)
-    ap.add_argument("--output-dir", default="./output")
+    ap.add_argument("--output-dir", default="skills/openclaw-southbound-weekly/output")
+    ap.add_argument("--agent-yaml", default="skills/openclaw-southbound-weekly/agents/openai.yaml")
+    ap.add_argument("--skip-feishu-upload", action="store_true")
     ap.add_argument("--feishu-app-id", default=os.getenv("FEISHU_APP_ID"))
     ap.add_argument("--feishu-app-secret", default=os.getenv("FEISHU_APP_SECRET"))
     ap.add_argument("--feishu-folder-token", default=os.getenv("FEISHU_FOLDER_TOKEN"))
-    ap.add_argument("--skip-feishu-upload", action="store_true")
     args = ap.parse_args()
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1) 读取最新一期文件，并提取文件后缀日期作为周期起点
     latest, start_date = latest_file(Path(args.input_dir))
-    raw = read_any(latest)
-    data = build_dataset(raw)
+    codes = read_stock_codes(latest)
+    agent_cfg = parse_simple_yaml_agent(Path(args.agent_yaml))
 
-    code_col = pick_col(data, ["code", "stock_code", "symbol"])
-    name_col = pick_col(data, ["name", "stock_name"])
-    ind_col = pick_col(data, ["industry", "industry_name", "sector"])
-    inflow_col = pick_col(data, ["south_net_inflow", "southbound_net_inflow", "net_inflow"])
+    prompt = build_analysis_prompt(codes, start_date)
+    raw = call_model(agent_cfg, prompt)
 
-    # 2) 从文件内聚合展示Top2行业（文件已预筛为Top10股票）
-    top2 = []
-    if inflow_col and ind_col:
-        top2 = (
-            data.groupby(ind_col, as_index=False)[inflow_col]
-            .sum()
-            .sort_values(inflow_col, ascending=False)
-            .head(2)[ind_col]
-            .tolist()
-        )
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"模型未返回合法JSON: {e}; 原始输出: {raw[:500]}") from e
 
-    # 3) 计算评分与两种策略收益
-    scored = compute_scores(data)
-    pnl_df, use_latest = calc_pnl(scored, args.capital)
+    rows = normalize_and_calc(payload.get("stocks", []), args.capital)
 
-    selection_cols = [code_col, name_col, ind_col, "fundamental_score", "technical_score", "capital_score", "total_score", "suggest_weight"]
-    if inflow_col:
-        selection_cols.insert(3, inflow_col)
-    pnl_cols = [code_col, name_col, "buy_price", "sell_price", "ret", "amount_suggest", "pnl_suggest", "amount_equal", "pnl_equal"]
+    write_csv(
+        output_dir / "top10_selection.csv",
+        rows,
+        [
+            "code",
+            "name",
+            "industry",
+            "fundamental_analysis",
+            "technical_analysis",
+            "capital_flow_analysis",
+            "trend_next_week",
+            "suggest_weight",
+        ],
+    )
+    write_csv(
+        output_dir / "allocation_and_pnl.csv",
+        rows,
+        [
+            "code",
+            "name",
+            "monday_open",
+            "sell_price",
+            "ret",
+            "amount_suggest",
+            "pnl_suggest",
+            "amount_equal",
+            "pnl_equal",
+        ],
+    )
 
-    # 4) 输出中间结果表
-    selection = pnl_df[selection_cols].copy()
-    pnl_out = pnl_df[pnl_cols].copy()
-    selection.to_csv(output_dir / "top10_selection.csv", index=False)
-    pnl_out.to_csv(output_dir / "allocation_and_pnl.csv", index=False)
-
-    weighted_pnl = pnl_out["pnl_suggest"].sum()
-    equal_pnl = pnl_out["pnl_equal"].sum()
+    weighted_pnl = sum(r["pnl_suggest"] for r in rows)
+    equal_pnl = sum(r["pnl_equal"] for r in rows)
     excess = weighted_pnl - equal_pnl
-    sell_rule = "最新收盘" if use_latest else "周五收盘"
 
-    # 5) 生成汇总文档
     summary = f"""# 南向资金周度组合汇总
 
-- 周期起始日（来自最新文件后缀日期）：{start_date}
-- 数据文件：{latest}
-- 执行时间：{dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+- 周期起始日（文件后缀日期）：{start_date}
+- 输入文件：{latest}
+- 运行时间：{dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+- 模型：{agent_cfg['provider']}/{agent_cfg['model']}
 
-## 一、行业与股票范围
+## 一、输入说明
 
-- 输入文件已预筛选为“最近一周南向资金流入最多Top2行业的Top10股票”
-- 行业（按文件聚合）：{', '.join(map(str, top2)) if top2 else '未提供南向净流入字段，无法聚合行业'}
-- 本次纳入股票数量：{len(selection)}
+- 输入文件仅包含股票代码列表。
+- 基本面、技术指标、当周资金流入与价格数据由大模型检索并分析。
 
-## 二、未来一周走势分析与建议配比
+## 二、策略收益
 
-- 分析维度：基本面（35%）+技术面（25%）+资金面（40%）
-- 总资金：{args.capital:,.2f} 元
-- 每只股票建议买入配比与金额见 `allocation_and_pnl.csv` 中 `amount_suggest`
-
-## 三、收益测算
-
-- 卖出规则：{sell_rule}
-- 策略A（建议配比）总收益：{weighted_pnl:,.2f} 元
-- 策略B（等额配比）总收益：{equal_pnl:,.2f} 元
-
-## 四、对比结论
-
+- 策略A（建议配比）收益：{weighted_pnl:,.2f} 元
+- 策略B（15万元等额）收益：{equal_pnl:,.2f} 元
 - 超额收益（A-B）：{excess:,.2f} 元
-- {'建议采用策略A。' if excess > 0 else '建议采用策略B或继续优化打分权重。'}
-"""
 
+## 三、输出文件
+
+- top10_selection.csv
+- allocation_and_pnl.csv
+"""
     summary_path = output_dir / "summary.md"
     summary_path.write_text(summary, encoding="utf-8")
 
-    # 6) 视配置决定是否上传飞书云文档
     feishu_result = "未上传"
     if args.skip_feishu_upload:
         feishu_result = "已跳过（--skip-feishu-upload）"
     elif args.feishu_app_id and args.feishu_app_secret and args.feishu_folder_token:
         try:
-            feishu_url = upload_to_feishu_drive(summary_path, args.feishu_app_id, args.feishu_app_secret, args.feishu_folder_token)
-            feishu_result = feishu_url or "上传成功（未返回URL）"
-        except (RuntimeError, urllib.error.URLError, TimeoutError) as e:
+            feishu_result = upload_to_feishu_drive(summary_path, args.feishu_app_id, args.feishu_app_secret, args.feishu_folder_token)
+        except Exception as e:
             feishu_result = f"上传失败: {e}"
     else:
-        feishu_result = "未配置飞书参数（需要 APP_ID/APP_SECRET/FOLDER_TOKEN）"
+        feishu_result = "缺少飞书参数"
 
     print(summary)
-    print(f"\n飞书云文档上传结果: {feishu_result}")
-    print(f"输出文件目录: {output_dir.resolve()}")
+    print(f"飞书上传结果: {feishu_result}")
+    print(f"输出目录: {output_dir.resolve()}")
 
 
 if __name__ == "__main__":
