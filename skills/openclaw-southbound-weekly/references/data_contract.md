@@ -1,46 +1,19 @@
-# 数据契约（简化版）
+# 数据契约（最新）
 
-## 输入文件
+## 输入
 
-- 目录：`/home/admin/.openclaw/workspace/stockdata/south_stocklist`
-- 文件名：需包含 `YYYYMMDD` 后缀日期
-- 内容：仅股票代码列表（txt/csv）
+- 文件路径：`/home/admin/.openclaw/workspace/stockdata/south_stocklist`
+- 文件名：需包含 `YYYYMMDD`
+- 文件内容：仅股票代码（每行一个，或csv第一列）
 
-### txt 示例
+## 分析来源
 
-```text
-00700.HK
-00941.HK
-03690.HK
-```
+- 文本分析（基本面/技术面/资金流）：系统默认大模型
+- 价格数据（收益计算）：AKShare
+  - 港股 `stock_hk_hist`
+  - A股 `stock_zh_a_hist`
 
-### csv 示例
+## 输出
 
-```csv
-code
-00700.HK
-00941.HK
-03690.HK
-```
-
-## 大模型返回结构
-
-脚本要求模型返回 JSON，核心字段：
-
-- `stocks[]`
-  - `code`
-  - `name`
-  - `industry`
-  - `fundamental_analysis`
-  - `technical_analysis`
-  - `capital_flow_analysis`
-  - `trend_next_week`
-  - `suggest_weight`
-  - `monday_open`
-  - `sell_price`
-
-## 输出文件
-
-- `top10_selection.csv`
-- `allocation_and_pnl.csv`
-- `summary.md`
+- 脚本默认不落地本地文件
+- 仅生成文档内容，并询问是否创建飞书文档写入
